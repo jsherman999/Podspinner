@@ -1,0 +1,8 @@
+{
+  "enabledPlugins": {
+    "frontend@mag-claude-plugins": true,
+    "code-analysis@mag-claude-plugins": true,
+    "bun@mag-claude-plugins": true,
+    "orchestration@mag-claude-plugins": true
+  }
+}
