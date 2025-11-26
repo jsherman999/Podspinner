@@ -1,0 +1,25 @@
+{
+  "name": "podman-orchestrator",
+  "version": "1.0.0",
+  "description": "CLI tool to orchestrate podman containers for server farm simulation",
+  "main": "dist/index.js",
+  "bin": {
+    "podman-orchestrator": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": ["podman", "orchestrator", "containers", "sshd", "server-farm"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "inquirer": "^12.0.0"
+  }
+}
