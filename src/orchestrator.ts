@@ -1,6 +1,8 @@
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
-import { writeFile, readFile, existsSync } from 'fs/promises';
+import { writeFile, readFile, copyFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { basename } from 'path';
 
 const execAsync = promisify(exec);
 
@@ -11,6 +13,10 @@ interface ContainerConfig {
   portStart: number;
   cpus: string;
   memory: string;
+  scripts: string[];
+  initScript: string;
+  dockerfileInstructions: string;
+  volumes: string[];
 }
 
 interface ContainerInfo {
@@ -19,6 +25,7 @@ interface ContainerInfo {
   port: number;
   status: string;
   created: string;
+  uptime?: string | null;
 }
 
 const STATE_FILE = './orchestrator-state.json';
@@ -66,6 +73,40 @@ export class Orchestrator {
     console.log(`Pulling base image: ${config.image}`);
     await this.executePodmanCommand(`podman pull ${config.image}`);
 
+    // Copy scripts to build context if provided
+    const copiedFiles: string[] = [];
+    if (config.scripts.length > 0) {
+      console.log('Copying custom scripts to build context...');
+      for (let i = 0; i < config.scripts.length; i++) {
+        const scriptPath = config.scripts[i];
+        const scriptName = basename(scriptPath);
+        const destPath = `./script_${i}_${scriptName}`;
+
+        try {
+          await copyFile(scriptPath, destPath);
+          copiedFiles.push(destPath);
+          console.log(`  - Copied ${scriptPath} to build context`);
+        } catch (error: any) {
+          throw new Error(`Failed to copy script ${scriptPath}: ${error.message}`);
+        }
+      }
+    }
+
+    // Copy init script if provided
+    if (config.initScript) {
+      console.log('Copying initialization script...');
+      const initScriptName = basename(config.initScript);
+      const destPath = `./init_script_${initScriptName}`;
+
+      try {
+        await copyFile(config.initScript, destPath);
+        copiedFiles.push(destPath);
+        console.log(`  - Copied ${config.initScript} to build context`);
+      } catch (error: any) {
+        throw new Error(`Failed to copy init script ${config.initScript}: ${error.message}`);
+      }
+    }
+
     // Create a temporary Dockerfile to extend the base image
     const dockerfileContent = this.generateDockerfile(config);
     await writeFile('./Dockerfile', dockerfileContent);
@@ -75,9 +116,12 @@ export class Orchestrator {
     console.log(`Building custom image: ${customImageName}`);
     await this.executePodmanCommand(`podman build -t ${customImageName} .`);
 
-    // Clean up Dockerfile
+    // Clean up Dockerfile and copied scripts
     try {
       execSync('rm ./Dockerfile');
+      for (const file of copiedFiles) {
+        execSync(`rm ${file}`);
+      }
     } catch (e) {
       // Ignore cleanup errors
     }
@@ -89,7 +133,7 @@ export class Orchestrator {
 
       console.log(`Starting container: ${containerName} on port ${port}`);
 
-      const cmd = [
+      const cmdParts = [
         'podman run -d',
         `--name ${containerName}`,
         `--cpus=${config.cpus}`,
@@ -97,9 +141,18 @@ export class Orchestrator {
         `-p ${port}:22`,
         '--cap-add=NET_ADMIN',
         '--cap-add=NET_RAW',
-        customImageName
-      ].join(' ');
+      ];
 
+      // Add volume mounts if provided
+      if (config.volumes.length > 0) {
+        for (const volume of config.volumes) {
+          cmdParts.push(`-v ${volume}`);
+        }
+      }
+
+      cmdParts.push(customImageName);
+
+      const cmd = cmdParts.join(' ');
       const containerId = await this.executePodmanCommand(cmd);
 
       this.containers.push({
@@ -127,6 +180,43 @@ export class Orchestrator {
       `RUN apt-get update && apt-get install -y openssh-server ${config.packages.join(' ')} && apt-get clean` :
       `RUN apt-get update && apt-get install -y openssh-server && apt-get clean`;
 
+    // Handle script copying
+    let scriptCopyInstructions = '';
+    if (config.scripts.length > 0) {
+      scriptCopyInstructions = '\n# Copy custom scripts\nRUN mkdir -p /usr/local/scripts\n';
+      for (let i = 0; i < config.scripts.length; i++) {
+        const scriptName = config.scripts[i].split('/').pop();
+        scriptCopyInstructions += `COPY ./script_${i}_${scriptName} /usr/local/scripts/${scriptName}\n`;
+        scriptCopyInstructions += `RUN chmod +x /usr/local/scripts/${scriptName}\n`;
+      }
+    }
+
+    // Handle init script
+    let initScriptInstructions = '';
+    let startupCommand = '["/usr/sbin/sshd", "-D"]';
+
+    if (config.initScript) {
+      const initScriptName = config.initScript.split('/').pop();
+      initScriptInstructions = `\n# Copy and setup initialization script
+COPY ./init_script_${initScriptName} /usr/local/bin/init.sh
+RUN chmod +x /usr/local/bin/init.sh\n`;
+
+      // Create a startup script that runs init script then starts SSH
+      initScriptInstructions += `\n# Create startup wrapper
+RUN echo '#!/bin/bash' > /usr/local/bin/startup.sh && \\
+    echo '/usr/local/bin/init.sh' >> /usr/local/bin/startup.sh && \\
+    echo 'exec /usr/sbin/sshd -D' >> /usr/local/bin/startup.sh && \\
+    chmod +x /usr/local/bin/startup.sh\n`;
+
+      startupCommand = '["/usr/local/bin/startup.sh"]';
+    }
+
+    // Handle custom Dockerfile instructions
+    let customInstructions = '';
+    if (config.dockerfileInstructions) {
+      customInstructions = `\n# Custom Dockerfile instructions\n${config.dockerfileInstructions}\n`;
+    }
+
     return `FROM ${config.image}
 
 RUN apt-get update && apt-get install -y sudo
@@ -144,12 +234,12 @@ RUN echo 'root:orch123' | chpasswd
 
 # Generate SSH host keys
 RUN ssh-keygen -A
-
+${scriptCopyInstructions}${initScriptInstructions}${customInstructions}
 # Expose SSH port
 EXPOSE 22
 
 # Start SSH daemon
-CMD ["/usr/sbin/sshd", "-D"]`;
+CMD ${startupCommand}`;
   }
 
   async stopAllContainers(): Promise<void> {
